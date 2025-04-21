@@ -1,0 +1,9 @@
+# example command
+python ./src/lora_finetune.py \
+  --task factual_knowledge \
+  --data_dir ./data/ \
+  --output_dir ./output/ \
+  --batch_size 1 \
+  --gradient_accumulation_steps 1 \
+  --epochs 1 \
+  --lr 2e-4 \
