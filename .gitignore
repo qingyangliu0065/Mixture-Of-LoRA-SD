@@ -1,0 +1,4 @@
+output/
+.cache/
+.slurm_logs/
+wandb/

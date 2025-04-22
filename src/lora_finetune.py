@@ -1,30 +1,49 @@
 import argparse
-from tqdm import tqdm
 import os
 import random
 import json
 import logging
 import numpy as np
 from datetime import datetime
+from tqdm.auto import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
 from accelerate import Accelerator
 import wandb
-from datasets import load_dataset
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def get_max_chat_length(data, tokenizer):
+    system_prompt = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    max_len = 0
+    for item in data:
+        input_text = item["input"]
+        output_text = item["output"]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": input_text},
+            {"role": "assistant", "content": output_text}
+        ]
+        chat_text = tokenizer.apply_chat_template(messages, tokenize=False)
+        input_ids = tokenizer(chat_text, truncation=False)["input_ids"]
+        max_len = max(max_len, len(input_ids))
+    
+    return max_len, max_len  # Return the same value for both max_len and padded_len
+
+
 class CustomDataset(Dataset):
-    def __init__(self, data, tokenizer, max_length, prompt_template):
+    def __init__(self, data, tokenizer, max_length):
         self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.prompt_template = prompt_template
+        self.system_prompt = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 
     def __len__(self):
         return len(self.data)
@@ -33,198 +52,84 @@ class CustomDataset(Dataset):
         item = self.data[idx]
         input_text = item["input"]
         output_text = item["output"]
-        
-        # Format using prompt template
-        formatted_text = self.prompt_template.format(
-            input=input_text,
-            output=output_text
-        )
-        
-        # Tokenize
-        encoded = self.tokenizer(
-            formatted_text,
+
+        # Build the message format expected by Qwen
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": input_text},
+            {"role": "assistant", "content": output_text}
+        ]
+        full_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        tokenized = self.tokenizer(
+            full_text,
             max_length=self.max_length,
-            padding="max_length",
             truncation=True,
+            padding=False,
             return_tensors="pt"
         )
-        
-        # Create labels (only compute loss on the output part)
-        labels = encoded["input_ids"].clone()
-        
-        # Prepare input portion mask - figure out where the output begins
-        prompt_only = self.prompt_template.format(input=input_text, output="")
-        prompt_len = len(self.tokenizer.encode(prompt_only)) - 1  # -1 because we don't want to mask the first output token
-        
-        # Set -100 for input portion (no loss)
-        labels[0, :prompt_len] = -100
-        
-        input_ids = encoded["input_ids"].squeeze()
-        attention_mask = encoded["attention_mask"].squeeze()
-        labels = labels.squeeze()
-        
+
+        # Prompt-only message (to determine where labels start)
+        prompt_only = messages[:-1]
+        prompt_text = self.tokenizer.apply_chat_template(prompt_only, tokenize=False, add_generation_prompt=True)
+        prompt_len = len(self.tokenizer(prompt_text, truncation=True, max_length=self.max_length)["input_ids"])
+
+        input_ids = tokenized["input_ids"].squeeze()
+        attention_mask = tokenized["attention_mask"].squeeze()
+        labels = input_ids.clone()
+        labels[:prompt_len] = -100
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels
         }
 
+
 def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
     trainable_params = 0
     all_param = 0
-    for _, param in model.named_parameters():
+    for name, param in model.named_parameters():
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
+        # Print the name of the parameter and whether it is trainable
+        # print(name, param.requires_grad)
     logger.info(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
     )
 
+
 def load_jsonl_data(file_path):
-    """
-    Load data from a jsonl file.
-    """
     data = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             data.append(json.loads(line))
     return data
 
-def get_prompt_template(task_type):
-    """
-    Returns an appropriate prompt template based on task_type.
-    You can customize templates for each task type.
-    """
-    templates = {
-        "math": "<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>",
-        "coding": "<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>",
-        "factual_knowledge": "<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>",
-        "creative_writing": "<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
-    }
-    
-    # Default to factual_knowledge template if task_type not found
-    return templates.get(task_type, templates["factual_knowledge"])
 
 def prepare_datasets(args, tokenizer):
-    """
-    Prepare train, validation, and test datasets.
-    """
-    # Load from jsonl files
     train_data = load_jsonl_data(os.path.join(args.data_dir, args.task, "train.jsonl"))
     val_data = load_jsonl_data(os.path.join(args.data_dir, args.task, "validation.jsonl"))
-    test_data = load_jsonl_data(os.path.join(args.data_dir, args.task, "test.jsonl"))
-    
-    # Extract task type from first example (assuming all examples have the same task type)
-    task_type = train_data[0]["task_type"] if len(train_data) > 0 else args.task
-    
-    # Get appropriate prompt template for this task
-    prompt_template = get_prompt_template(task_type)
-    
-    # If using data percentage < 100%, sample the data
-    if args.percentage < 1.0:
-        random.shuffle(train_data)
-        train_data = train_data[:int(len(train_data) * args.percentage)]
-    
-    logger.info(f"Task: {task_type}, Train samples: {len(train_data)}, Val samples: {len(val_data)}, Test samples: {len(test_data)}")
-    
-    # Create datasets
-    train_dataset = CustomDataset(train_data, tokenizer, args.max_token_length, prompt_template)
-    val_dataset = CustomDataset(val_data, tokenizer, args.max_token_length, prompt_template)
-    test_dataset = CustomDataset(test_data, tokenizer, args.max_token_length, prompt_template)
-    
-    return train_dataset, val_dataset, test_dataset, task_type
 
-def compute_metrics(eval_preds):
-    """
-    Compute evaluation metrics.
-    """
-    logits, labels = eval_preds
+    if args.debug:
+        train_data = train_data[:200]
+        val_data = val_data[:50]
     
-    # Get predictions (argmax)
-    predictions = np.argmax(logits, axis=-1)
-    
-    # Create a mask for valid labels (not -100)
-    mask = labels != -100
-    
-    # Compute accuracy only on valid positions
-    valid_preds = predictions[mask]
-    valid_labels = labels[mask]
-    
-    accuracy = np.sum(valid_preds == valid_labels) / len(valid_labels) if len(valid_labels) > 0 else 0
-    
-    return {
-        "accuracy": accuracy
-    }
+    # Shuffle the data
+    random.shuffle(train_data)
+    logger.info(f"Task: {args.task}, Train samples: {len(train_data)}, Val samples: {len(val_data)}")
 
-def generate_samples(args, model, tokenizer, test_dataset, task_type, num_samples=5):
-    """
-    Generate sample outputs for qualitative evaluation.
-    """
-    if not args.main_process:
-        return
+    # Compute max token length from training set if not provided
+    max_raw_len, padded_len = get_max_chat_length(train_data, tokenizer)
+    logger.info(f"Max token length in training set: {max_raw_len} → using {padded_len}")
+    args.max_token_length = padded_len
     
-    model.eval()
-    samples = []
+    # Build datasets
+    train_dataset = CustomDataset(train_data, tokenizer, args.max_token_length)
+    val_dataset = CustomDataset(val_data, tokenizer, args.max_token_length)
     
-    # Sample a few examples from test set
-    indices = random.sample(range(len(test_dataset)), min(num_samples, len(test_dataset)))
-    
-    for i in indices:
-        example = test_dataset.data[i]
-        input_text = example["input"]
-        
-        # Format using prompt template
-        prompt_template = get_prompt_template(task_type)
-        prompt = prompt_template.format(input=input_text, output="")
-        
-        # Tokenize with attention mask
-        encoded = tokenizer(
-            prompt, 
-            return_tensors="pt",
-            return_attention_mask=True
-        )
-        input_ids = encoded["input_ids"].to(model.device)
-        attention_mask = encoded["attention_mask"].to(model.device)
-        
-        # Generate
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=512,
-                temperature=0.7,
-                do_sample=True,
-                num_return_sequences=1,
-                eos_token_id=tokenizer.eos_token_id
-            )
-            
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        
-        # Extract just the generated part
-        assistant_part = generated_text.split("<|im_start|>assistant")[-1].split("<|im_end|>")[0]
-        
-        # Log sample
-        samples.append({
-            "input": input_text,
-            "expected": example["output"],
-            "generated": assistant_part.strip()
-        })
-    
-    # Log to wandb
-    if args.use_wandb and args.main_process:
-        for i, sample in enumerate(samples):
-            wandb.log({f"sample_{i+1}/input": sample["input"],
-                    f"sample_{i+1}/expected": sample["expected"],
-                    f"sample_{i+1}/generated": sample["generated"]})
-            
-    else:
-        for i, sample in enumerate(samples):
-            logger.info(f"Sample {i+1}: Input: {sample['input']}, Expected: {sample['expected']}, Generated: {sample['generated']}")
-    
-    return samples
+    return train_dataset, val_dataset
+
 
 def seed_everything(seed):
     """
@@ -250,7 +155,7 @@ def main():
     parser.add_argument("--task", type=str, required=True, help="Task name (math, coding, factual_knowledge, creative_writing)")
     parser.add_argument("--data_dir", type=str, default="./data/")
     parser.add_argument("--output_dir", type=str, default="./output/")
-    parser.add_argument("--cache_dir", type=str, default="./cache/")
+    parser.add_argument("--cache_dir", type=str, default="./.cache/")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=1)
@@ -260,8 +165,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--eval_steps", type=int, default=200)
-    parser.add_argument("--percentage", type=float, default=1.0, help="Percentage of training data to use")
+    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--save_steps", type=int, default=50)
+    parser.add_argument("--debug", action="store_true", help="Use a small subset of data for fast testing")
     
     # LoRA arguments
     parser.add_argument("--lora_r", type=int, default=16)
@@ -270,25 +176,30 @@ def main():
     parser.add_argument("--target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj")
     
     # Other arguments
-    parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit mode")
-    parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit mode")
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_project", type=str, default="lora-finetune")
     parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
     
     args = parser.parse_args()
     
+    # Initialize accelerator
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="fp16"
+    )
+    args.device = accelerator.device
+    logger.info(f"Using device: {args.device}")
+    
     # Prepare output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    args.run_name = f"{args.task}_{timestamp}"
+    args.run_name = args.run_name or f"{args.task}_{timestamp}"
     args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Set up distributed training
-    args.main_process = args.local_rank in [-1, 0]
-    
-    # Set random seed
+    # Only log on main process
+    args.main_process = accelerator.is_local_main_process
     seed_everything(args.seed)
     
     # Initialize wandb if main process
@@ -301,11 +212,13 @@ def main():
         )
     
     # Load tokenizer
-    logger.info(f"Loading tokenizer: {args.tokenizer}")
+    if args.main_process:
+        logger.info(f"Loading tokenizer: {args.tokenizer}")
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer, 
         trust_remote_code=True,
-        use_fast=False
+        use_fast=False, 
+        cache_dir=args.cache_dir
     )
     # Ensure tokenizer has padding token
     if tokenizer.pad_token is None:
@@ -313,11 +226,28 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
     # Prepare datasets
-    logger.info("Preparing datasets...")
-    train_dataset, val_dataset, test_dataset, task_type = prepare_datasets(args, tokenizer)
+    if args.main_process:
+        logger.info("Preparing datasets...")
+    train_dataset, val_dataset = prepare_datasets(args, tokenizer)
     
+    # Create DataLoaders
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=True
+    )
+    
+    eval_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True
+    )
+
     # LoRA config
-    logger.info("Setting up LoRA config...")
+    if args.main_process:
+        logger.info("Setting up LoRA config...")
     target_modules = args.target_modules.split(",")
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -329,84 +259,152 @@ def main():
     )
     
     # Load base model
-    logger.info(f"Loading model: {args.model}")
-    model_kwargs = {
-        "trust_remote_code": True,
-        "cache_dir": args.cache_dir,
-        "torch_dtype": torch.bfloat16,
-    }
-    
-    if args.load_in_8bit:
-        model_kwargs["load_in_8bit"] = True
-    elif args.load_in_4bit:
-        model_kwargs["load_in_4bit"] = True
-        model_kwargs["quantization_config"] = {
-            "bnb_4bit_compute_dtype": torch.bfloat16,
-            "bnb_4bit_use_double_quant": True,
-            "bnb_4bit_quant_type": "nf4"
-        }
-    
-    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
-    
-    # Prepare model for k-bit training if using quantization
-    if args.load_in_8bit or args.load_in_4bit:
-        model = prepare_model_for_kbit_training(model)
+    if args.main_process:
+        logger.info(f"Loading model: {args.model}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        trust_remote_code=True,
+        cache_dir=args.cache_dir,
+        torch_dtype=torch.float16,
+        device_map=args.device
+    )
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if args.main_process:
+            logger.info("Gradient checkpointing enabled")
     
     # Apply LoRA config
     model = get_peft_model(model, lora_config)
     
+    # Print trainable parameters
     if args.main_process:
         print_trainable_parameters(model)
     
-    # Set up Trainer
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        overwrite_output_dir=True,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.lr,
+    # Set up optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
         weight_decay=0.01,
-        warmup_ratio=0.03,
-        lr_scheduler_type="cosine",
-        logging_dir=os.path.join(args.output_dir, "logs"),
-        logging_steps=args.logging_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.eval_steps,
-        save_total_limit=3,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        fp16=True,
-        report_to="wandb" if args.use_wandb else "none",
-        ddp_find_unused_parameters=False,
-        optim="adamw_torch",
+        betas=(0.9, 0.999),
+        eps=1e-08
     )
     
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
+    # Set up learning rate scheduler
+    num_training_steps = len(train_dataloader) * args.epochs
+    num_warmup_steps = int(0.03 * num_training_steps)
+    
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_training_steps - num_warmup_steps
     )
     
-    # Training
-    logger.info("Starting training...")
-    trainer.train()
+    # Prepare everything with accelerator
+    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    )
     
-    # Save final model
+    # Training loop
     if args.main_process:
-        logger.info("Saving model...")
-        model.save_pretrained(os.path.join(args.output_dir, "final"))
+        logger.info("Starting training...")
+    model.train()
+    completed_steps = 0
+    best_eval_loss = float('inf')
     
-    # Generate some samples for evaluation
-    logger.info("Generating samples...")
-    samples = generate_samples(args, model, tokenizer, test_dataset, task_type)
+    for epoch in range(args.epochs):
+        # Progress bar
+        if args.main_process:
+            train_progress_bar = tqdm(
+                total=len(train_dataloader),
+                desc=f"Epoch {epoch+1}/{args.epochs}",
+                disable=not args.main_process
+            )
+        for step, batch in enumerate(train_dataloader):
+            # Forward pass
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                loss = outputs.loss
+                accelerator.backward(loss)
+                
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                completed_steps += 1
+
+            # Update progress bar
+            if args.main_process:
+                train_progress_bar.update(1)
+                train_progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+            
+            # Log training loss
+            if args.main_process and completed_steps % args.logging_steps == 0:
+                accelerator.print(f"Epoch: {epoch}, Step: {completed_steps}, Loss: {loss.item()}")
+                if args.use_wandb:
+                    wandb.log({"train_loss": loss.item(), "lr": lr_scheduler.get_last_lr()[0]}, step=completed_steps)
+            
+            # Evaluation
+            if completed_steps % args.eval_steps == 0:
+                model.eval()
+                eval_loss = 0
+                eval_steps = 0
+
+                # Create evaluation progress bar
+                if args.main_process:
+                    eval_progress_bar = tqdm(
+                        total=len(eval_dataloader),
+                        desc="Evaluation",
+                        disable=not args.main_process
+                    )
+                
+                for eval_batch in eval_dataloader:
+                    with torch.no_grad():
+                        outputs = model(**eval_batch)
+                    eval_loss += outputs.loss.item()
+                    eval_steps += 1
+
+                    # Update evaluation progress bar
+                    if args.main_process:
+                        eval_progress_bar.update(1)
+                
+                eval_loss = eval_loss / eval_steps
+                
+                if args.main_process:
+                    # Close evaluation progress bar
+                    eval_progress_bar.close()
+                    accelerator.print(f"Evaluation at step {completed_steps}: Loss: {eval_loss}")
+                    if args.use_wandb:
+                        wandb.log({"eval_loss": eval_loss}, step=completed_steps)
+                
+                # Save best model
+                if args.main_process and eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.save_pretrained(
+                        os.path.join(args.output_dir, "best_model"),
+                        is_main_process=accelerator.is_main_process,
+                        save_function=accelerator.save,
+                    )
+                    accelerator.print(f"Best model saved with loss: {best_eval_loss}")
+                
+                # Save checkpoint
+                if completed_steps % args.save_steps == 0:
+                    if args.main_process:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        unwrapped_model.save_pretrained(
+                            os.path.join(args.output_dir, f"checkpoint-{completed_steps}"),
+                            is_main_process=accelerator.is_main_process,
+                            save_function=accelerator.save,
+                        )
+                        accelerator.print(f"Checkpoint saved at step {completed_steps}")
+                
+                model.train()
+
+        # Close training progress bar
+        if args.main_process:
+            train_progress_bar.close()
     
     # Finish wandb
     if args.use_wandb and args.main_process:
