@@ -1,9 +1,14 @@
+"""
+Create a router using the training data.
+"""
+
 import argparse
 import os
 import json
 import sys
 from transformers import AutoModel
 import torch
+
 # Switch to parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.router import EmbeddingSimilarityRouter
@@ -15,6 +20,9 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="./.cache/")
     parser.add_argument("--data_dir", type=str, default="./data/")
     parser.add_argument("--output_dir", type=str, default="./weights/")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument("--similarity_metric", type=str, default="cosine")
     args = parser.parse_args()
 
     # Load embedding model
@@ -31,9 +39,9 @@ def main():
     router = EmbeddingSimilarityRouter(
         embedding_model,
         tasks,
-        temperature=1.0,
-        top_k=None,
-        similarity_metric="cosine",
+        temperature=args.temperature,
+        top_k=args.top_k,
+        similarity_metric=args.similarity_metric,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
 
