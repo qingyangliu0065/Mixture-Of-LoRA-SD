@@ -4,5 +4,6 @@ python ./src/router_create.py \
     --data_dir "./data/" \
     --output_dir "./weights/" \
     --temperature 1 \
-    --similarity_metric "euclidean"
+    --similarity_metric "euclidean" \
+    --visualization
 

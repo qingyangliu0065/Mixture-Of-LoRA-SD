@@ -20,9 +20,11 @@ def main():
     parser.add_argument("--cache_dir", type=str, default="./.cache/")
     parser.add_argument("--data_dir", type=str, default="./data/")
     parser.add_argument("--output_dir", type=str, default="./weights/")
+    parser.add_argument("--fig_dir", type=str, default="./figs/")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--similarity_metric", type=str, default="cosine")
+    parser.add_argument("--visualization", action="store_true", help="Create visualization of embeddings")
     args = parser.parse_args()
 
     # Load embedding model
@@ -57,6 +59,11 @@ def main():
     
     # Compute task centroids
     router.compute_task_centroids(task_examples)
+
+    # Create visualization if requested
+    if args.visualization:
+        os.makedirs(args.fig_dir, exist_ok=True)
+        router.visualize_embeddings(task_examples, os.path.join(args.fig_dir, "embeddings_visualization.png"))
 
     # Save router
     router.save(args.output_dir)

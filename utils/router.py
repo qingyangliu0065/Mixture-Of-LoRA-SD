@@ -5,6 +5,9 @@ import torch.nn.functional as F
 import os
 import json
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +38,9 @@ class EmbeddingSimilarityRouter:
 
         self.embedding_model.to(self.device)
         self.task_centroids = None
+        self.task_embeddings = {}  # Store embeddings for each task
+        self.all_embeddings = None  # Store concatenated embeddings
+        self.all_labels = None  # Store task labels
 
     
     def compute_embeddings(self, texts: List[str]) -> torch.Tensor:
@@ -49,6 +55,9 @@ class EmbeddingSimilarityRouter:
 
     def compute_task_centroids(self, task_examples: Dict[str, List[str]]):
         task_centroids = {}
+        self.task_embeddings = {}
+        all_embeddings_list = []
+        all_labels_list = []
 
         for task_name, examples in task_examples.items():
             logger.info(f"Computing centroid for task '{task_name}' from {len(examples)} examples")
@@ -68,9 +77,13 @@ class EmbeddingSimilarityRouter:
             pbar.close()
 
             task_embeddings = torch.cat(all_embeddings, dim=0)
+            self.task_embeddings[task_name] = task_embeddings
             task_centroid = task_embeddings.mean(dim=0)
             task_centroids[task_name] = task_centroid
-            print(task_centroids)
+
+            # Store for visualization
+            all_embeddings_list.append(task_embeddings)
+            all_labels_list.extend([self.tasks.index(task_name)] * len(examples))
 
         # Convert to tensor
         embedding_dim = next(iter(task_centroids.values())).shape[0]
@@ -78,6 +91,10 @@ class EmbeddingSimilarityRouter:
 
         for i, task_name in enumerate(self.tasks):
             self.task_centroids[i] = task_centroids[task_name]
+
+        # Store concatenated embeddings and labels
+        self.all_embeddings = torch.cat(all_embeddings_list, dim=0)
+        self.all_labels = torch.tensor(all_labels_list)
 
         return self.task_centroids
 
@@ -161,3 +178,58 @@ class EmbeddingSimilarityRouter:
 
         logger.info(f"Router loaded from {path}")
         return router
+
+    def visualize_embeddings(self, task_examples: Dict[str, List[str]], save_path: Optional[str] = None):
+        """
+        Visualize embeddings using PCA and plot them with different colors for each task.
+        Also shows task centroids.
+        """
+        if self.all_embeddings is None or self.all_labels is None:
+            raise ValueError("Embeddings not computed. Call compute_task_centroids first.")
+        
+        # Apply PCA to reduce to 2D
+        pca = PCA(n_components=2)
+        reduced_embeddings = pca.fit_transform(self.all_embeddings.cpu().numpy())
+        
+        # Create the plot
+        plt.figure(figsize=(12, 8))
+        
+        # Plot embeddings for each task
+        task_colors = plt.cm.Set1(np.linspace(0, 1, len(self.tasks)))
+        for task_idx, task_name in enumerate(self.tasks):
+            task_mask = self.all_labels.cpu().numpy() == task_idx
+            task_embeddings = reduced_embeddings[task_mask]
+            
+            # Plot individual points
+            plt.scatter(
+                task_embeddings[:, 0], 
+                task_embeddings[:, 1],
+                color=task_colors[task_idx],
+                label=task_name,
+                alpha=0.6
+            )
+            
+            # Plot task centroid
+            if self.task_centroids is not None:
+                centroid_2d = pca.transform(self.task_centroids[task_idx].cpu().numpy().reshape(1, -1))
+                plt.scatter(
+                    centroid_2d[0, 0],
+                    centroid_2d[0, 1],
+                    color=task_colors[task_idx],
+                    marker='*',
+                    s=200,
+                    edgecolor='black',
+                    linewidth=1
+                )
+        
+        plt.title('Task Embeddings Visualization')
+        plt.xlabel('PCA Component 1')
+        plt.ylabel('PCA Component 2')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        if save_path:
+            plt.savefig(save_path)
+            plt.close()
+        else:
+            plt.show()
