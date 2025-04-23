@@ -8,30 +8,48 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=xinyuel4@andrew.cmu.edu
 
-TASKS=("math" "coding" "factual_knowledge" "creative_writing")
+# TASKS=("math" "coding" "factual_knowledge" "creative_writing")
 
-# Loop through each task
-for TASK in "${TASKS[@]}"; do
-  echo "Starting training for task: $TASK"
+# # Loop through each task
+# for TASK in "${TASKS[@]}"; do
+#   echo "Starting training for task: $TASK"
 
-  accelerate launch ./src/lora_finetune.py \
-    --model "Qwen/Qwen2.5-7B-Instruct" \
-    --tokenizer "Qwen/Qwen2.5-7B-Instruct" \
-    --task "$TASK" \
-    --data_dir ./data/ \
-    --output_dir ./output/ \
-    --batch_size 1 \
-    --gradient_accumulation_steps 1 \
-    --epochs 2 \
-    --lr 1e-5 \
-    --logging_steps 10 \
-    --eval_steps 125 \
-    --save_steps 125 \
-    --use_wandb \
-    --wandb_entity "irisiris" \
-    --wandb_project "lora_${TASK}" \
-    --run_name "${TASK}_7b_1e-5_2epoch"
+#   accelerate launch ./src/lora_finetune.py \
+#     --model "Qwen/Qwen2.5-7B-Instruct" \
+#     --tokenizer "Qwen/Qwen2.5-7B-Instruct" \
+#     --task "$TASK" \
+#     --data_dir ./data/ \
+#     --output_dir ./output/ \
+#     --batch_size 1 \
+#     --gradient_accumulation_steps 1 \
+#     --epochs 2 \
+#     --lr 1e-5 \
+#     --logging_steps 10 \
+#     --eval_steps 125 \
+#     --save_steps 125 \
+#     --use_wandb \
+#     --wandb_entity "irisiris" \
+#     --wandb_project "lora_${TASK}" \
+#     --run_name "${TASK}_7b_1e-5_2epoch"
 
-    echo "Completed training for task: $TASK"
-  echo "========================================"
-done
+#     echo "Completed training for task: $TASK"
+#   echo "========================================"
+# done
+
+accelerate launch ./src/lora_finetune.py \
+  --model "Qwen/Qwen2.5-7B-Instruct" \
+  --tokenizer "Qwen/Qwen2.5-7B-Instruct" \
+  --task "factual_knowledge" \
+  --data_dir ./data/ \
+  --output_dir ./output/ \
+  --batch_size 1 \
+  --gradient_accumulation_steps 1 \
+  --epochs 2 \
+  --lr 1e-5 \
+  --logging_steps 10 \
+  --eval_steps 125 \
+  --save_steps 125 \
+  --use_wandb \
+  --wandb_entity "irisiris" \
+  --wandb_project "lora_factual_knowledge" \
+  --run_name "factual_knowledge_7b_1e-5_2epoch"

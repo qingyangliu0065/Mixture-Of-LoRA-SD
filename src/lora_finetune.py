@@ -120,9 +120,15 @@ def prepare_datasets(args, tokenizer):
     logger.info(f"Task: {args.task}, Train samples: {len(train_data)}, Val samples: {len(val_data)}")
 
     # Compute max token length from training set if not provided
-    max_raw_len, padded_len = get_max_chat_length(train_data, tokenizer)
-    logger.info(f"Max token length in training set: {max_raw_len} → using {padded_len}")
-    args.max_token_length = padded_len
+    max_raw_len, _ = get_max_chat_length(train_data, tokenizer)
+    max_allowed_len = 6144
+
+    if max_raw_len > max_allowed_len:
+        logger.warning(f"Max token length ({max_raw_len}) exceeds limit → truncating to {max_allowed_len}")
+        args.max_token_length = max_allowed_len
+    else:
+        args.max_token_length = max_raw_len
+    logger.info(f"Final max token length used: {args.max_token_length}")
     
     # Build datasets
     train_dataset = CustomDataset(train_data, tokenizer, args.max_token_length)
@@ -180,7 +186,6 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="lora-finetune")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
-    parser.add_argument("--local_rank", type=int, default=-1)
     
     args = parser.parse_args()
     
