@@ -25,13 +25,12 @@ for TASK in "${TASKS[@]}"; do
     --epochs 2 \
     --lr 1e-5 \
     --logging_steps 10 \
-    --eval_steps 100 \
-    --save_steps 500 \
+    --eval_steps 125 \
+    --save_steps 125 \
     --use_wandb \
     --wandb_entity "irisiris" \
     --wandb_project "lora_${TASK}" \
-    --run_name "${TASK}_7b_1e-5_2epoch" \
-    --debug
+    --run_name "${TASK}_7b_1e-5_2epoch"
 
     echo "Completed training for task: $TASK"
   echo "========================================"
