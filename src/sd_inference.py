@@ -184,7 +184,7 @@ def main():
             results.append(result)
             
             # Write result to output file
-            with open(results_file, "w") as f:
+            with open(results_file, "a") as f:
                 f.write(json.dumps(result) + "\n")
 
         except Exception as e:
