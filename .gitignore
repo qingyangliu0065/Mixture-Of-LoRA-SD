@@ -3,3 +3,4 @@ weights/
 .slurm_logs/
 wandb/
 utils/__pycache__/
+results/
