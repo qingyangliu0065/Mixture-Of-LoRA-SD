@@ -19,7 +19,7 @@
 #     --tokenizer "Qwen/Qwen2.5-7B-Instruct" \
 #     --task "$TASK" \
 #     --data_dir ./data/ \
-#     --output_dir ./output/ \
+#     --output_dir ./weights/ \
 #     --batch_size 1 \
 #     --gradient_accumulation_steps 1 \
 #     --epochs 2 \
@@ -41,7 +41,7 @@ accelerate launch ./src/lora_finetune.py \
   --tokenizer "Qwen/Qwen2.5-7B-Instruct" \
   --task "factual_knowledge" \
   --data_dir ./data/ \
-  --output_dir ./output/ \
+  --output_dir ./weights/ \
   --batch_size 1 \
   --gradient_accumulation_steps 1 \
   --epochs 2 \

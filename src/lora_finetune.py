@@ -121,7 +121,7 @@ def prepare_datasets(args, tokenizer):
 
     # Compute max token length from training set if not provided
     max_raw_len, _ = get_max_chat_length(train_data, tokenizer)
-    max_allowed_len = 6144
+    max_allowed_len = 5120
 
     if max_raw_len > max_allowed_len:
         logger.warning(f"Max token length ({max_raw_len}) exceeds limit → truncating to {max_allowed_len}")
@@ -160,7 +160,7 @@ def main():
     # Task and data arguments
     parser.add_argument("--task", type=str, required=True, help="Task name (math, coding, factual_knowledge, creative_writing)")
     parser.add_argument("--data_dir", type=str, default="./data/")
-    parser.add_argument("--output_dir", type=str, default="./output/")
+    parser.add_argument("--output_dir", type=str, default="./weights/")
     parser.add_argument("--cache_dir", type=str, default="./.cache/")
     
     # Training arguments

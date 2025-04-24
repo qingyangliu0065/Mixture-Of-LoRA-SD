@@ -15,7 +15,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--tokenizer", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--lora_path", type=str, default="./output/")
+    parser.add_argument("--lora_path", type=str, default="./weights/")
     parser.add_argument("--task", type=str, default="math")
     parser.add_argument("--data_dir", type=str, default="./data/")
     parser.add_argument("--cache_dir", type=str, default="./.cache/")
