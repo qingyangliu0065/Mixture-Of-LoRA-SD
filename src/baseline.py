@@ -18,6 +18,7 @@ parser.add_argument("--task", type=str, choices=["coding", "creative_writing", "
 parser.add_argument("--assistant_model", type=str, default="Qwen/Qwen2.5-7B-Instruct", help="Assistant model checkpoint")
 parser.add_argument("--target_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="Target model checkpoint")
 parser.add_argument("--num_assistant_tokens", type=int, default=20, help="Number of tokens assistant model generates each time")
+parser.add_argument("--assistant_token_schedule", type=str, default="constant", choices=["constant", "heuristic", "heuristic_transient"], help="Assistant token schedule")
 parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
 parser.add_argument("--assistant_temperature", type=float, default=0, help="Sampling temperature for assistant model")
 parser.add_argument("--debug", action="store_true", help="Debug mode")
@@ -54,7 +55,7 @@ model.eval()
 assistant_model.eval()
 
 assistant_model.generation_config.num_assistant_tokens = args.num_assistant_tokens
-assistant_model.generation_config.num_assistant_tokens_schedule = "constant"
+assistant_model.generation_config.num_assistant_tokens_schedule = args.assistant_token_schedule
 assistant_model.generation_config.assistant_confidence_threshold = 0
 assistant_model.generation_config.temperature = args.assistant_temperature
 
@@ -165,11 +166,11 @@ for category in categories:
         }
     }
     
-    # Name the output file as 'baseline_<category>_<num_assistant_tokens>.json'
-    output_path = output_dir / f"baseline_{category}_{args.num_assistant_tokens}.json"
+    # Name the output file as 'baseline_<category>_<assistant_token_schedule>_<debug>.json'
+    output_path = output_dir / f"baseline_{category}_{args.assistant_token_schedule}_{'debug' if args.debug else ''}.json"
     with open(output_path, "w") as out_f:
         json.dump(output_data, out_f, indent=2)
 
     print(f"\nResults for category '{category}' saved to: {output_path}")
 
-print(f"\nAll evaluations completed. Output files are named: baseline_<category>_{args.num_assistant_tokens}.json")
+print(f"\nAll evaluations completed. Output files are named: baseline_<category>_<assistant_token_schedule>_<debug>.json")

@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=sd-baseline-factual-knowledge
+#SBATCH --job-name=sd-baseline-math-heuristic-transient
 #SBATCH --gres=gpu:A6000:1
 #SBATCH --mem=80G
 #SBATCH --partition=general
-#SBATCH --output=.slurm_logs/sd-baseline-factual-knowledge.out
+#SBATCH --output=.slurm_logs/sd-baseline-math-heuristic-transient.out
 #SBATCH --time=01-00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=qliu3@andrew.cmu.edu
@@ -22,7 +22,8 @@ NUM_ASSISTANT_TOKENS=15
 TEMPERATURE=0.3
 TARGET_MODEL="Qwen/Qwen2.5-14B-Instruct"
 ASSISTANT_MODEL="Qwen/Qwen2.5-7B-Instruct"
-SPECIFIC_TASK="factual_knowledge"
+SPECIFIC_TASK="math"
+ASSISTANT_TOKEN_SCHEDULE="heuristic_transient"
 
 echo "Running evaluation for specific task: $SPECIFIC_TASK"
 
@@ -34,10 +35,12 @@ python ./src/baseline.py \
     --assistant_model "$ASSISTANT_MODEL" \
     --target_model "$TARGET_MODEL" \
     --num_assistant_tokens $NUM_ASSISTANT_TOKENS \
+    --assistant_token_schedule $ASSISTANT_TOKEN_SCHEDULE \
     --temperature $TEMPERATURE \
+    --debug
 
 echo "Completed task: $SPECIFIC_TASK"
-echo "Output saved to: baseline_${SPECIFIC_TASK}_${NUM_ASSISTANT_TOKENS}.json"
+echo "Output saved to: baseline_${SPECIFIC_TASK}_${ASSISTANT_TOKEN_SCHEDULE}.json"
 
 
 # # Run all tasks with a single model load (more efficient)

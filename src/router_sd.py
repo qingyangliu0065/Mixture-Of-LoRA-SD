@@ -13,6 +13,8 @@ import time
 import torch
 from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
+from accelerate import init_empty_weights
+from accelerate.utils import get_balanced_memory
 # Switch to parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.router import EmbeddingSimilarityRouter
@@ -31,11 +33,13 @@ def main():
     parser.add_argument("--task", type=str, default="math")
     parser.add_argument("--router_temperature", type=float, default=1.0)
     parser.add_argument("--target_temperature", type=float, default=1.0)
-    parser.add_argument("--router_strategy", type=str, default="max", choices=["max", "merge"])
+    parser.add_argument("--router_strategy", type=str, default="max", choices=["max", "merge", "max_base"])
+    parser.add_argument("--assistant_token_schedule", type=str, default="constant", choices=["constant", "heuristic", "heuristic_transient"])
     parser.add_argument("--debug", action="store_true", help="Use a small subset of data for fast testing")
     args = parser.parse_args()
     
-    NUM_ASSISTANT_TOKENS = [15, 15, 15, 15]
+    # NUM_ASSISTANT_TOKENS = [15, 15, 15, 15, 15]
+    NUM_ASSISTANT_TOKENS = [10, 8, 5, 5, 8]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Laod embedding model
@@ -51,6 +55,8 @@ def main():
     router = EmbeddingSimilarityRouter.load(args.router_dir, embedding_model)
     router.temperature = args.router_temperature
     
+    router_tasks = router.tasks
+    
 
     # Load data
     test_data = []
@@ -60,35 +66,60 @@ def main():
             test_data.append(example['input'])
 
     if args.debug:
-        test_data = test_data[:5]
+        test_data = test_data[:20]
 
     # Route data
-    task_weights, similarity = router.compute_routing_weights(test_data)
-    print(task_weights)
-    # Find the task with the highest weight; task_weights is a tensor of shape (num_data, num_tasks)
-    # Loop through each row of task_weights
-    # During inference, if we consider merging multiple adapters, we can use this method to find the second highest weight
+    # change to compute weights for a batch of 10 examples at a time
+    task_weights = []
+    for i in tqdm(range(len(test_data)), desc="Computing task weights"):
+        task_weights.append(router.compute_routing_weights(test_data[i])[0])
+    task_weights = torch.cat(task_weights, dim=0)
+    
+    print(task_weights.shape)
     
     pred_max_categories = torch.argmax(task_weights, dim=1)
+    # print the average / median of the max weights
+    print("average max weight: ", torch.mean(task_weights[torch.arange(task_weights.shape[0]), pred_max_categories]))
+    print("median max weight: ", torch.median(task_weights[torch.arange(task_weights.shape[0]), pred_max_categories]))
+    
+    
+    if args.router_strategy == "max_base":
+        # check the max weight, if lower than 0.5, then use the base model
+        for i in range(task_weights.shape[0]):
+            if task_weights[i, pred_max_categories[i]] < 0.5:
+                pred_max_categories[i] = 4
+    
+    # count the number of examples for each task, inclduing the base model
     num_per_category = {}
-    for i, task in enumerate(router.tasks):
-        num_per_category[task] = pred_max_categories.count(i)
+    for i, task in enumerate(router_tasks):
+        num_per_category[task] = (pred_max_categories == i).sum().item()
+    
+    if args.router_strategy == "max_base":
+        num_per_category["base"] = (pred_max_categories == 4).sum().item()
     
     print(num_per_category)
     
-    if args.router_strategy == "merge":
-        pred_merge_categories = []
-        for i in range(task_weights.shape[0]): 
-            max_weight_idx = pred_max_categories[i]
-            threshold = 0.7 * task_weights[i, max_weight_idx]
-            candidate_tasks = [max_weight_idx, -1]
-            second_max_weight = 0
-            for j in range(task_weights.shape[1]):
-                if task_weights[i, j] > threshold and task_weights[i, j] > second_max_weight:
-                    second_max_weight = task_weights[i, j]
-                    candidate_tasks[1] = j
-            pred_merge_categories.append(candidate_tasks)
+    # elif args.router_strategy == "merge":
+    #     pred_merge_categories = []
+    #     for i in range(task_weights.shape[0]): 
+    #         max_weight_idx = pred_max_categories[i]
+    #         threshold = 0.7 * task_weights[i, max_weight_idx]
+    #         candidate_tasks = [max_weight_idx, -1]
+    #         second_max_weight = 0
+    #         for j in range(task_weights.shape[1]):
+    #             if task_weights[i, j] > threshold and task_weights[i, j] > second_max_weight:
+    #                 second_max_weight = task_weights[i, j]
+    #                 candidate_tasks[1] = j
+    #         pred_merge_categories.append(candidate_tasks)
     
+        # delete router
+    del router
+    del embedding_model
+    del task_weights
+    torch.cuda.empty_cache()
+    
+    # for debug
+    # exit()
     
     # load the target model
     target_model = AutoModelForCausalLM.from_pretrained(
@@ -117,6 +148,7 @@ def main():
     
     # speculative inference loop
     target_model.eval()
+    assistant_model.eval()
     
     # Count forward calls
     call_counter = {"n_calls": 0}
@@ -133,65 +165,84 @@ def main():
     total_examples = 0
     total_wall_time = 0.0
     
-    if args.router_strategy == "max":
-        for i in tqdm(range(task_weights.shape[0]), desc="Speculative inference loop"):
-            # load the lora model
-            pred_task_idx = pred_max_categories[i]
-            pred_task = router.tasks[pred_task_idx]
-            lora_path = os.path.join(args.lora_dir, f"{pred_task}_7b_1e-5_2epoch", "best_model")
-            lora_model = PeftModel.from_pretrained(assistant_model, lora_path)
-            lora_model.eval()
-            lora_model.to("cuda")
-            
-            lora_model.generation_config.num_assistant_tokens = NUM_ASSISTANT_TOKENS[pred_task_idx]
-            lora_model.generation_config.num_assistant_tokens_schedule = "constant"
-            lora_model.generation_config.assistant_confidence_threshold = 0
-            lora_model.generation_config.temperature = 0
-            
-            # generate the response
-            prompt = test_data[i]
-            inputs = tokenizer(prompt, return_tensors="pt").to(device)
-            prompt_len = inputs.input_ids.shape[-1]
+    existed_adapters = set()
+    
 
-            call_counter["n_calls"] = 0  # reset for each example
+    for i in tqdm(range(len(test_data)), desc="Speculative inference loop"):
+        # load the lora model
+        pred_task_idx = pred_max_categories[i]
+        print("pred_task_idx: ", pred_task_idx)
+        
+        if pred_task_idx != 4:
+            pred_task = router_tasks[pred_task_idx]
+            if pred_task not in existed_adapters:
+                lora_path = os.path.join(args.lora_dir, f"{pred_task}_7b_1e-5_2epoch", "best_model")
+                assistant_model.load_adapter(
+                    peft_model_id=lora_path, 
+                    adapter_name=pred_task, 
+                    device_map="auto")
+                existed_adapters.add(pred_task)
+            # set the adapter to the current task
+            assistant_model.set_adapter(pred_task)
+            print("active adapters: ", assistant_model.active_adapters())
+        # if the type is base, use the base model
+        else:
+            # deactivate all adapters
+            pred_task = "base"
+            # check if there's any active adapter
+            if len(existed_adapters) > 0:
+                assistant_model.disable_adapters()
+                print("active adapters: None")
+        
+        assistant_model.eval()
+        # assistant_model.to("cuda")
+        
+        assistant_model.generation_config.num_assistant_tokens = NUM_ASSISTANT_TOKENS[pred_task_idx]
+        assistant_model.generation_config.num_assistant_tokens_schedule = args.assistant_token_schedule
+        assistant_model.generation_config.assistant_confidence_threshold = 0
+        assistant_model.generation_config.temperature = 0
+        
+        # generate the response
+        prompt = test_data[i]
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt_len = inputs.input_ids.shape[-1]
 
-            start_time = time.time()
-            outputs = target_model.generate(
-                **inputs,
-                assistant_model=lora_model,
-                return_dict_in_generate=True,
-                output_scores=True,
-                max_new_tokens=200,
-                temperature=args.target_temperature,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            end_time = time.time()
+        call_counter["n_calls"] = 0  # reset for each example
 
-            wall_time = end_time - start_time
-            total_wall_time += wall_time
+        start_time = time.time()
+        outputs = target_model.generate(
+            **inputs,
+            assistant_model=assistant_model,
+            return_dict_in_generate=True,
+            output_scores=True,
+            max_new_tokens=200,
+            temperature=args.target_temperature,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        end_time = time.time()
 
-            total_len = outputs.sequences.shape[-1]
-            new_tokens = total_len - prompt_len
-            num_calls = call_counter["n_calls"]
-            avg_accept = new_tokens / num_calls if num_calls > 0 else 0
-            decoded_text = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)[0]
+        wall_time = end_time - start_time
+        total_wall_time += wall_time
 
-            total_accepts += avg_accept
-            total_examples += 1
+        total_len = outputs.sequences.shape[-1]
+        new_tokens = total_len - prompt_len
+        num_calls = call_counter["n_calls"]
+        avg_accept = new_tokens / num_calls if num_calls > 0 else 0
+        decoded_text = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)[0]
 
-            results.append({
-                "category": args.task,
-                "pred_category": pred_task,
-                "prompt": prompt,
-                "output": decoded_text,
-                "new_tokens": new_tokens,
-                "num_calls": num_calls,
-                "avg_accept": round(avg_accept, 2),
-                "wall_time_sec": round(wall_time, 4),
-            })
-            
-            # delete the lora model
-            del lora_model
+        total_accepts += avg_accept
+        total_examples += 1
+
+        results.append({
+            "category": args.task,
+            "pred_category": pred_task,
+            "prompt": prompt,
+            "output": decoded_text,
+            "new_tokens": new_tokens,
+            "num_calls": num_calls,
+            "avg_accept": round(avg_accept, 2),
+            "wall_time_sec": round(wall_time, 4),
+        })
             
     # Create summary for this category
     category_summary = {
@@ -214,8 +265,8 @@ def main():
         }
     }
     
-    # Name the output file as 'router_<strategy>_<category>_<num_assistant_tokens>.json'
-    output_path = os.path.join(args.output_dir, f"router_{args.router_strategy}_{args.task}_{NUM_ASSISTANT_TOKENS[0]}.json")
+    # Name the output file as 'router_<category>_<strategy>_<assistant_token_schedule>.json'
+    output_path = os.path.join(args.output_dir, f"router_{args.task}_{args.router_strategy}_{args.assistant_token_schedule}.json")
     with open(output_path, "w") as out_f:
         json.dump(output_data, out_f, indent=2)
         
