@@ -1,9 +1,6 @@
 # https://huggingface.co/blog/dynamic_speculation_lookahead
 import os
-cache_dir = "/ocean/projects/cis240042p/sliang6/hf_cache"
-os.environ['HF_HOME'] = cache_dir
-
-
+import argparse
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from pathlib import Path
@@ -11,19 +8,51 @@ import json
 from tqdm import tqdm
 import time
 
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="Run baseline evaluation with dynamic speculation")
+parser.add_argument("--cache_dir", type=str, default="/ocean/projects/cis240042p/sliang6/hf_cache", help="Hugging Face cache directory")
+parser.add_argument("--data_dir", type=str, default="data", help="Directory containing the evaluation data")
+parser.add_argument("--result_dir", type=str, default="results", help="Directory to store results")
+parser.add_argument("--task", type=str, choices=["coding", "creative_writing", "factual_knowledge", "math", "all"], 
+                    default="all", help="Category of data to evaluate")
+parser.add_argument("--assistant_model", type=str, default="Qwen/Qwen2.5-7B-Instruct", help="Assistant model checkpoint")
+parser.add_argument("--target_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="Target model checkpoint")
+parser.add_argument("--num_assistant_tokens", type=int, default=20, help="Number of tokens assistant model generates each time")
+parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+parser.add_argument("--debug", action="store_true", help="Debug mode")
+
+args = parser.parse_args()
+
+# Set environment variables
+# os.environ['HF_HOME'] = args.cache_dir
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
-checkpoint = "Qwen/Qwen2.5-14B-Instruct"
-assistant_checkpoint = "Qwen/Qwen2.5-7B-Instruct"
+checkpoint = args.target_model
+assistant_checkpoint = args.assistant_model
 
+print(f"Loading tokenizer from: {checkpoint}")
 tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(checkpoint, torch_dtype=torch.float16).to(device)
-assistant_model = AutoModelForCausalLM.from_pretrained(assistant_checkpoint, torch_dtype=torch.float16).to(device)
-print(f"Model was loaded from: {model.config._name_or_path}")
+print(f"Tokenizer was loaded.")
+print(f"Loading model from: {checkpoint}")
+model = AutoModelForCausalLM.from_pretrained(
+    checkpoint, 
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True).to(device)
+print(f"Model was loaded.")
+print(f"Loading assistant model from: {assistant_checkpoint}")
+assistant_model = AutoModelForCausalLM.from_pretrained(
+    assistant_checkpoint, 
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True).to(device)
+print(f"Assistant model was loaded.")
 
-assistant_model.generation_config.num_assistant_tokens = 20
+# Set models to evaluation mode
+model.eval()
+assistant_model.eval()
+
+assistant_model.generation_config.num_assistant_tokens = args.num_assistant_tokens
 assistant_model.generation_config.num_assistant_tokens_schedule = "constant"
 assistant_model.generation_config.assistant_confidence_threshold = 0
 
@@ -38,9 +67,12 @@ def counting_forward(*args, **kwargs):
 model.forward = counting_forward
 
 # Evaluation loop
-base_path = Path("data")
+base_path = Path(args.data_dir)
 categories = ["coding", "creative_writing", "factual_knowledge", "math"]
-output_dir = Path("results")
+if args.task != "all":
+    categories = [args.task]
+
+output_dir = Path(args.result_dir)
 output_dir.mkdir(exist_ok=True)
 
 all_results = []
@@ -60,6 +92,9 @@ for category in categories:
 
     with open(test_file, "r") as f:
         lines = f.readlines()
+    
+    if args.debug:
+        lines = lines[:5]
 
     for line in tqdm(lines, desc=f"Evaluating category: {category}"):
         entry = json.loads(line)
@@ -79,6 +114,7 @@ for category in categories:
             return_dict_in_generate=True,
             output_scores=True,
             max_new_tokens=200,
+            temperature=args.temperature,
             pad_token_id=tokenizer.eos_token_id,
         )
         end_time = time.time()
@@ -116,9 +152,16 @@ for category in categories:
 # Save everything
 output_data = {
     "results": all_results,
-    "summary": category_summaries
+    "summary": category_summaries,
+    "config": {
+        "target_model": args.target_model,
+        "assistant_model": args.assistant_model,
+        "num_assistant_tokens": args.num_assistant_tokens,
+        "temperature": args.temperature
+    }
 }
-output_path = output_dir / "all_eval_results.json"
+# name the output file as 'baseline_<task>_<num_assistant_tokens>.json'
+output_path = output_dir / f"baseline_{args.task}_{args.num_assistant_tokens}.json"
 with open(output_path, "w") as out_f:
     json.dump(output_data, out_f, indent=2)
 
