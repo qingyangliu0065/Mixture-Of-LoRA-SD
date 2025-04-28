@@ -19,7 +19,9 @@ parser.add_argument("--assistant_model", type=str, default="Qwen/Qwen2.5-7B-Inst
 parser.add_argument("--target_model", type=str, default="Qwen/Qwen2.5-14B-Instruct", help="Target model checkpoint")
 parser.add_argument("--num_assistant_tokens", type=int, default=20, help="Number of tokens assistant model generates each time")
 parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+parser.add_argument("--assistant_temperature", type=float, default=0, help="Sampling temperature for assistant model")
 parser.add_argument("--debug", action="store_true", help="Debug mode")
+parser.add_argument("--run_all_tasks", action="store_true", help="Run all tasks with a single model load")
 
 args = parser.parse_args()
 
@@ -39,15 +41,14 @@ print(f"Loading model from: {checkpoint}")
 model = AutoModelForCausalLM.from_pretrained(
     checkpoint, 
     torch_dtype=torch.float16,
-    low_cpu_mem_usage=True).to(device)
+    device_map="auto")
 print(f"Model was loaded.")
 print(f"Loading assistant model from: {assistant_checkpoint}")
 assistant_model = AutoModelForCausalLM.from_pretrained(
     assistant_checkpoint, 
     torch_dtype=torch.float16,
-    low_cpu_mem_usage=True).to(device)
+    device_map="auto")
 print(f"Assistant model was loaded.")
-
 # Set models to evaluation mode
 model.eval()
 assistant_model.eval()
@@ -55,6 +56,7 @@ assistant_model.eval()
 assistant_model.generation_config.num_assistant_tokens = args.num_assistant_tokens
 assistant_model.generation_config.num_assistant_tokens_schedule = "constant"
 assistant_model.generation_config.assistant_confidence_threshold = 0
+assistant_model.generation_config.temperature = args.assistant_temperature
 
 # Count forward calls
 call_counter = {"n_calls": 0}
@@ -68,23 +70,26 @@ model.forward = counting_forward
 
 # Evaluation loop
 base_path = Path(args.data_dir)
-categories = ["coding", "creative_writing", "factual_knowledge", "math"]
-if args.task != "all":
-    categories = [args.task]
-
 output_dir = Path(args.result_dir)
 output_dir.mkdir(exist_ok=True)
 
-all_results = []
-category_summaries = {}
+# Determine which categories to evaluate
+if args.run_all_tasks or args.task == "all":
+    categories = ["coding", "creative_writing", "factual_knowledge", "math"]
+else:
+    categories = [args.task]
 
+# Process each category
 for category in categories:
+    print(f"\n{'='*50}")
+    print(f"Evaluating category: {category}")
+    print(f"{'='*50}")
+    
     test_file = base_path / category / "test.jsonl"
     if not test_file.exists():
         print(f"Test file not found for {category}, skipping.")
         continue
 
-    print(f"Evaluating category: {category}")
     category_results = []
     total_accepts = 0
     total_examples = 0
@@ -141,28 +146,30 @@ for category in categories:
             "wall_time_sec": round(wall_time, 4),
         })
 
-    # Store summary stats
-    all_results.extend(category_results)
-    category_summaries[category] = {
+    # Create summary for this category
+    category_summary = {
         "num_examples": total_examples,
         "avg_accept_length": round(total_accepts / total_examples, 2) if total_examples > 0 else 0.0,
         "avg_wall_time_sec": round(total_wall_time / total_examples, 4) if total_examples > 0 else 0.0
     }
 
-# Save everything
-output_data = {
-    "results": all_results,
-    "summary": category_summaries,
-    "config": {
-        "target_model": args.target_model,
-        "assistant_model": args.assistant_model,
-        "num_assistant_tokens": args.num_assistant_tokens,
-        "temperature": args.temperature
+    # Save results for this category to a separate file
+    output_data = {
+        "results": category_results,
+        "summary": {category: category_summary},
+        "config": {
+            "target_model": args.target_model,
+            "assistant_model": args.assistant_model,
+            "num_assistant_tokens": args.num_assistant_tokens,
+            "temperature": args.temperature
+        }
     }
-}
-# name the output file as 'baseline_<task>_<num_assistant_tokens>.json'
-output_path = output_dir / f"baseline_{args.task}_{args.num_assistant_tokens}.json"
-with open(output_path, "w") as out_f:
-    json.dump(output_data, out_f, indent=2)
+    
+    # Name the output file as 'baseline_<category>_<num_assistant_tokens>.json'
+    output_path = output_dir / f"baseline_{category}_{args.num_assistant_tokens}.json"
+    with open(output_path, "w") as out_f:
+        json.dump(output_data, out_f, indent=2)
 
-print(f"\nAll evaluation results saved to: {output_path}")
+    print(f"\nResults for category '{category}' saved to: {output_path}")
+
+print(f"\nAll evaluations completed. Output files are named: baseline_<category>_{args.num_assistant_tokens}.json")
