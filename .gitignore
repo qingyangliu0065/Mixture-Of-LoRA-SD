@@ -1,6 +1,9 @@
-weights/
 .cache/
 .slurm_logs/
 wandb/
 utils/__pycache__/
 results/
+weights/coding_7b_1e-5_2epoch/checkpoint*
+weights/creative_writing_7b_1e-5_2epoch/checkpoint*
+weights/factual_knowledge_7b_1e-5_2epoch/checkpoint*
+weights/math_7b_1e-5_2epoch/checkpoint*

@@ -1,0 +1,1 @@
+{"tasks": ["math", "coding", "factual_knowledge", "creative_writing"], "temperature": 1.0, "top_k": null, "similarity_metric": "euclidean"}
